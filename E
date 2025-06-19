@@ -1,22 +1,25 @@
 name: maurogpt2
 channels:
-
-- conda-forge
-- pytorch
-- nvidia
-  dependencies:
-- python=3.10.12
-- pytorch=2.1.0
-- torchvision=0.16.0
-- torchaudio=2.1.0
-- pytorch-cuda=11.8
-- pip=23.3.1
-- pip:
-  - sentence-transformers==2.7.0
-  - chromadb==0.4.24
-  - PyPDF2==3.0.1
-  - fastapi==0.104.1
-  - uvicorn==0.24.0
-  - llama-cpp-python==0.2.20
-  - jinja2==3.1.2
-  - python-multipart==0.0.6
+  - conda-forge
+  - pytorch
+  - nvidia
+dependencies:
+  - python=3.10
+  - pytorch=2.1.0
+  - torchvision=0.16.0
+  - torchaudio=2.1.0
+  - pytorch-cuda=11.8
+  - numpy>=1.23,<1.27
+  - pip
+  - setuptools
+  - wheel
+  - ipykernel  # Optional
+  - pip:
+      - sentence-transformers==2.7.0
+      - chromadb==0.4.24
+      - PyPDF2==3.0.1
+      - fastapi==0.104.1
+      - uvicorn[standard]==0.24.0
+      - llama-cpp-python==0.2.20
+      - jinja2==3.1.2
+      - python-multipart==0.0.6
