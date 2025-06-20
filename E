@@ -12,11 +12,12 @@ dependencies:
   - numpy>=1.23,<1.27
   - tqdm
   - rich
+  - ipykernel
+  - notebook
+  - ipywidgets          # <- required for tqdm notebook progress bars
   - pip
   - setuptools
   - wheel
-  - ipykernel           # Enables kernel support in Jupyter
-  - notebook            # Jupyter Notebook interface
   - pip:
       - sentence-transformers==2.7.0
       - chromadb==0.4.24
