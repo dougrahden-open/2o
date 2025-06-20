@@ -223,21 +223,27 @@ def prepare_pdfs():
     print(f"Prepared {len(latest_pdfs)} PDFs in {PREPPED_PDFS_DIR}")
     return latest_pdfs
 
-# %% Cell 6: Model and Database Initialization
+# %% Cell 6: Model and Database Initialization (FP16 for A6000/A40)
+
+from transformers import AutoModel, AutoTokenizer
+from sentence_transformers import SentenceTransformer
 
 def setup_models():
-    """Initialize ChromaDB and load BGE embedding model"""
+    """Initialize ChromaDB and load BGE embedding model with FP16 support"""
     print("Setting up models and database...")
 
+    # GPU status
     if torch.cuda.is_available():
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        gpu_name = torch.cuda.get_device_name(0)
+        vram = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"GPU: {gpu_name} ({vram:.1f} GB)")
         print(f"Using FP16: {USE_FP16}")
         print(f"Embedding Batch Size: {EMBEDDING_BATCH_SIZE}")
     else:
-        print("WARNING: CUDA not available, using CPU")
+        print("WARNING: CUDA not available — using CPU fallback")
 
+    # Initialize ChromaDB
     chroma_client = chromadb.PersistentClient(path=str(ENGINE_DIR))
-
     try:
         chroma_client.delete_collection(COLLECTION_NAME)
         print(f"Deleted existing collection: {COLLECTION_NAME}")
@@ -246,17 +252,22 @@ def setup_models():
 
     collection = chroma_client.create_collection(name=COLLECTION_NAME)
 
-    model_kwargs = {}
-    if torch.cuda.is_available() and USE_FP16:
-        model_kwargs["torch_dtype"] = torch.float16
+    # Load embedding model with FP16 optimization
+    print(f"Loading embedding model from: {BGE_MODEL_PATH}")
+    if USE_FP16 and torch.cuda.is_available():
+        model = AutoModel.from_pretrained(str(BGE_MODEL_PATH), torch_dtype=torch.float16)
+        tokenizer = AutoTokenizer.from_pretrained(str(BGE_MODEL_PATH))
+        embedding_model = SentenceTransformer(modules=[tokenizer, model])
+        print("Model loaded in FP16")
+    else:
+        embedding_model = SentenceTransformer(str(BGE_MODEL_PATH))
+        print("Model loaded in default precision")
 
-    embedding_model = SentenceTransformer(
-        str(BGE_MODEL_PATH),
-        device="cuda" if torch.cuda.is_available() else "cpu",
-        model_kwargs=model_kwargs
-    )
+    # Warm up
+    print("Warming up model...")
+    _ = embedding_model.encode(["Warm-up embedding to activate model"])
+    print("Model ready.")
 
-    _ = embedding_model.encode(["Test embedding warmup"])
     return collection, embedding_model
 
 # %% Cell 7: PDF Text Extraction Functions
