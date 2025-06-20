@@ -11,6 +11,8 @@ import chromadb
 from chromadb.config import Settings
 import shutil
 import torch
+import gc
+from datetime import datetime
 
 # %% Cell 2: Configuration - Change base directory here for different environments
 
@@ -21,81 +23,88 @@ RAW_PDFS_DIR = INPUTS_DIR / "raw-pdfs"
 PREPPED_PDFS_DIR = INPUTS_DIR / "prepped-pdfs"
 ENGINE_DIR = BASE_DIR / "Engine"
 
-# Model paths
 BGE_MODEL_PATH = MODELS_DIR / "bge-large-en-v15"
 COLLECTION_NAME = "pdf_collection"
 
-print("[Setup] Base directories and model paths initialized")
+EMBEDDING_BATCH_SIZE = 256
+STORAGE_BATCH_SIZE = 2000
+CHUNK_SIZE = 400
+USE_FP16 = True
 
 # %% Cell 3: Directory Setup Functions
 
 def setup_directories():
     """Create all necessary directories if they don’t exist"""
-    for directory in [INPUTS_DIR, RAW_PDFS_DIR, PREPPED_PDFS_DIR, ENGINE_DIR]:
+    directories = [INPUTS_DIR, RAW_PDFS_DIR, PREPPED_PDFS_DIR, ENGINE_DIR]
+    for directory in directories:
         directory.mkdir(parents=True, exist_ok=True)
-        print(f"[Setup] Ensured directory exists: {directory}")
-    print(f"[Setup] All directories created or already exist in: {BASE_DIR}")
+    print(f"Directories set up in: {BASE_DIR}")
+    
+    for dir_name, dir_path in [
+        ("Raw PDFs", RAW_PDFS_DIR),
+        ("Prepped PDFs", PREPPED_PDFS_DIR),
+        ("ChromaDB", ENGINE_DIR)
+    ]:
+        if dir_path.exists():
+            file_count = len(list(dir_path.glob("*")))
+            print(f"  {dir_name}: {file_count} files")
 
 # %% Cell 4: PDF Selection Logic with Version Control
 
 def get_latest_pdfs():
-    """
-    Get the latest version of each PDF based on:
-    1. Suffix priority: _A -> _B -> _C -> _D -> _0 -> _1 -> _2 -> etc.
-    2. File modification date (newest wins)
-    """
+    """Get the latest version of each PDF"""
+    print("Scanning for PDFs...")
     pdf_groups = {}
-    print("[PDF Selection] Scanning for PDFs in:", RAW_PDFS_DIR)
 
     for pdf_file in RAW_PDFS_DIR.glob("*.pdf"):
         filename = pdf_file.stem
         mod_time = pdf_file.stat().st_mtime
-
-        if re.match(r'.*_[A-Z]$', filename):
+        
+        if re.match(r".*_[A-Z]$", filename):
             base_name = filename[:-2]
-            suffix_char = filename[-1]
-            suffix = ord(suffix_char) - ord('A')
-            suffix_type = 'letter'
-        elif re.match(r'.*_\d+$', filename):
-            parts = filename.rsplit('_', 1)
+            suffix = ord(filename[-1]) - ord("A")
+            suffix_type = "letter"
+        elif re.match(r".*_\d+$", filename):
+            parts = filename.rsplit("_", 1)
             base_name = parts[0]
             suffix = int(parts[1])
-            suffix_type = 'number'
+            suffix_type = "number"
         else:
             base_name = filename
             suffix = -1
-            suffix_type = 'base'
+            suffix_type = "base"
+        
+        pdf_groups.setdefault(base_name, []).append((suffix_type, suffix, mod_time, pdf_file))
 
-        if base_name not in pdf_groups:
-            pdf_groups[base_name] = []
-        pdf_groups[base_name].append((suffix_type, suffix, mod_time, pdf_file))
+    if not pdf_groups:
+        print(f"No PDFs found in {RAW_PDFS_DIR}")
+        return []
 
     latest_pdfs = []
-    print("[PDF Selection] Grouping and selecting latest versions...")
     for base_name, versions in pdf_groups.items():
         def sort_key(item):
-            suffix_type, suffix, mod_time, file_path = item
-            if suffix_type == 'number':
+            suffix_type, suffix, mod_time, _ = item
+            if suffix_type == "number":
                 return (2, suffix, mod_time)
-            elif suffix_type == 'letter':
+            elif suffix_type == "letter":
                 return (1, suffix, mod_time)
             else:
                 return (0, suffix, mod_time)
 
         sorted_versions = sorted(versions, key=sort_key, reverse=True)
         latest_file = sorted_versions[0][3]
-        latest_suffix = sorted_versions[0][1]
         latest_type = sorted_versions[0][0]
+        latest_suffix = sorted_versions[0][1]
 
-        if latest_type == 'number':
+        if latest_type == "number":
             suffix_desc = f"_{latest_suffix}"
-        elif latest_type == 'letter':
+        elif latest_type == "letter":
             suffix_desc = f"_{chr(latest_suffix + ord('A'))}"
         else:
             suffix_desc = "(base)"
 
         latest_pdfs.append(latest_file)
-        print(f"[PDF Selection] Selected: {latest_file.name} {suffix_desc} (from {len(versions)} versions)")
+        print(f"Selected: {latest_file.name} {suffix_desc} (from {len(versions)} versions)")
 
     return latest_pdfs
 
@@ -103,56 +112,228 @@ def get_latest_pdfs():
 
 def prepare_pdfs():
     """Copy latest PDFs to prepped directory, only if updates are needed"""
-    print("[Prep] Checking for latest PDFs...")
     latest_pdfs = get_latest_pdfs()
-
     if not latest_pdfs:
-        print("[Prep] No PDFs found in raw directory!")
+        print("No PDFs found in raw directory!")
         return []
 
     existing_prepped = list(PREPPED_PDFS_DIR.glob("*.pdf")) if PREPPED_PDFS_DIR.exists() else []
-    print(f"[Prep] Found {len(existing_prepped)} existing prepped PDFs")
 
-    needs_update = False
-
-    if len(existing_prepped) != len(latest_pdfs):
-        needs_update = True
-        print(f"[Prep] File count changed: {len(existing_prepped)} -> {len(latest_pdfs)}")
-    else:
-        existing_names = {f.name for f in existing_prepped}
-        latest_names = {f.name for f in latest_pdfs}
-
-        if existing_names != latest_names:
-            needs_update = True
-            print("[Prep] File names differ, update required")
-        else:
-            for latest_pdf in latest_pdfs:
-                prepped_file = PREPPED_PDFS_DIR / latest_pdf.name
-                if prepped_file.exists():
-                    latest_mod_time = latest_pdf.stat().st_mtime
-                    prepped_mod_time = prepped_file.stat().st_mtime
-                    if latest_mod_time > prepped_mod_time:
-                        needs_update = True
-                        print(f"[Prep] Newer version detected: {latest_pdf.name}")
-                        break
-                else:
-                    needs_update = True
-                    print(f"[Prep] Missing file: {latest_pdf.name}")
-                    break
+    needs_update = (
+        len(existing_prepped) != len(latest_pdfs)
+        or {f.name for f in existing_prepped} != {f.name for f in latest_pdfs}
+    )
 
     if not needs_update:
-        print("[Prep] No updates needed - all files are current")
+        for latest_pdf in latest_pdfs:
+            prepped_file = PREPPED_PDFS_DIR / latest_pdf.name
+            if not prepped_file.exists() or latest_pdf.stat().st_mtime > prepped_file.stat().st_mtime:
+                needs_update = True
+                break
+
+    if not needs_update:
+        print("No updates needed - all files are current")
         return latest_pdfs
 
     if PREPPED_PDFS_DIR.exists():
         shutil.rmtree(PREPPED_PDFS_DIR)
-        print("[Prep] Old prepped directory cleared")
     PREPPED_PDFS_DIR.mkdir(parents=True, exist_ok=True)
 
+    print("Copying latest PDFs...")
     for pdf_file in latest_pdfs:
         dest_path = PREPPED_PDFS_DIR / pdf_file.name
         shutil.copy2(pdf_file, dest_path)
-        print(f"[Prep] Copied: {pdf_file.name}")
+        print(f"  Copied: {pdf_file.name}")
 
-    print(f"[Prep] Prepared {len(latest_pdfs)} PDFs in {PREPPED_PDFS_DIR}")
+    print(f"Prepared {len(latest_pdfs)} PDFs in {PREPPED_PDFS_DIR}")
     return latest_pdfs
+
+# %% Cell 6: Model and Database Initialization
+
+def setup_models():
+    """Initialize ChromaDB and load BGE embedding model"""
+    print("Setting up models and database...")
+
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"Using FP16: {USE_FP16}")
+        print(f"Embedding Batch Size: {EMBEDDING_BATCH_SIZE}")
+    else:
+        print("WARNING: CUDA not available, using CPU")
+
+    chroma_client = chromadb.PersistentClient(path=str(ENGINE_DIR))
+
+    try:
+        chroma_client.delete_collection(COLLECTION_NAME)
+        print(f"Deleted existing collection: {COLLECTION_NAME}")
+    except:
+        print("No existing collection to delete")
+
+    collection = chroma_client.create_collection(name=COLLECTION_NAME)
+
+    model_kwargs = {}
+    if torch.cuda.is_available() and USE_FP16:
+        model_kwargs["torch_dtype"] = torch.float16
+
+    embedding_model = SentenceTransformer(
+        str(BGE_MODEL_PATH),
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        model_kwargs=model_kwargs
+    )
+
+    _ = embedding_model.encode(["Test embedding warmup"])
+    return collection, embedding_model
+
+# %% Cell 7: PDF Text Extraction Functions
+
+def extract_text_from_pdf(pdf_path):
+    """Extract text from PDF and split into optimized chunks"""
+    try:
+        reader = PdfReader(pdf_path)
+        chunks = []
+        for page_num, page in enumerate(reader.pages, 1):
+            text = page.extract_text()
+            if text and text.strip():
+                words = text.split()
+                for i in range(0, len(words), CHUNK_SIZE):
+                    chunk_words = words[i:i + CHUNK_SIZE]
+                    chunk_text = " ".join(chunk_words)
+                    if len(chunk_text.strip()) > 50:
+                        chunks.append({
+                            "text": chunk_text,
+                            "source_pdf": pdf_path.name,
+                            "page_number": page_num,
+                            "chunk_index": i // CHUNK_SIZE,
+                            "word_count": len(chunk_words)
+                        })
+        return chunks
+    except Exception as e:
+        print(f"Error processing {pdf_path.name}: {e}")
+        return []
+
+# %% Cell 8: Embedding Generation and Storage
+
+def embed_and_store_pdfs(collection, embedding_model):
+    """Process all prepped PDFs and store embeddings"""
+    print("Processing PDFs and generating embeddings...")
+    all_chunks = []
+
+    pdf_files = list(PREPPED_PDFS_DIR.glob("*.pdf"))
+    for i, pdf_file in enumerate(pdf_files, 1):
+        print(f"Processing ({i}/{len(pdf_files)}): {pdf_file.name}")
+        chunks = extract_text_from_pdf(pdf_file)
+        all_chunks.extend(chunks)
+
+    if not all_chunks:
+        print("No chunks to embed!")
+        return
+
+    texts = [chunk["text"] for chunk in all_chunks]
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    start_time = datetime.now()
+    embeddings = embedding_model.encode(
+        texts,
+        show_progress_bar=True,
+        batch_size=EMBEDDING_BATCH_SIZE,
+        convert_to_tensor=True,
+        normalize_embeddings=True,
+        device="cuda" if torch.cuda.is_available() else "cpu"
+    )
+    embedding_time = datetime.now() - start_time
+
+    if torch.cuda.is_available():
+        embeddings = embeddings.cpu().numpy()
+
+    print(f"Generated embeddings: {embeddings.shape} in {embedding_time}")
+
+    documents = texts
+    metadatas = [{
+        "source_pdf": c["source_pdf"],
+        "page_number": c["page_number"],
+        "chunk_index": c["chunk_index"],
+        "word_count": c["word_count"]
+    } for c in all_chunks]
+    ids = [f"{c['source_pdf']}_{c['page_number']}_{c['chunk_index']}" for c in all_chunks]
+
+    num_batches = (len(all_chunks) + STORAGE_BATCH_SIZE - 1) // STORAGE_BATCH_SIZE
+
+    for i in range(0, len(all_chunks), STORAGE_BATCH_SIZE):
+        end_idx = min(i + STORAGE_BATCH_SIZE, len(all_chunks))
+        collection.add(
+            documents=documents[i:end_idx],
+            embeddings=embeddings[i:end_idx].tolist(),
+            metadatas=metadatas[i:end_idx],
+            ids=ids[i:end_idx]
+        )
+        print(f"Stored batch {(i // STORAGE_BATCH_SIZE) + 1}/{num_batches}")
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        gc.collect()
+
+# %% Cell 9: Main Execution Pipeline
+
+def main():
+    """Main execution pipeline"""
+    start_time = datetime.now()
+    print("=" * 60)
+    print("MAUROGPT2 TRAINING PIPELINE")
+    print("=" * 60)
+    print(f"Started: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Base Directory: {BASE_DIR}")
+    print(f"BGE Model: {BGE_MODEL_PATH}")
+    print()
+
+    try:
+        print("DIRECTORY SETUP")
+        setup_directories()
+        print()
+
+        print("PDF PREPARATION")
+        latest_pdfs = prepare_pdfs()
+        if not latest_pdfs:
+            print("No PDFs found to process.")
+            return
+        print()
+
+        rebuild_needed = True
+        if PREPPED_PDFS_DIR.exists():
+            try:
+                chroma_client = chromadb.PersistentClient(path=str(ENGINE_DIR))
+                collection = chroma_client.get_collection(COLLECTION_NAME)
+                if collection.count() > 0:
+                    print(f"Database already exists with {collection.count()} embeddings")
+                    rebuild_needed = False
+            except:
+                pass
+
+        if rebuild_needed:
+            print("MODEL INITIALIZATION")
+            collection, embedding_model = setup_models()
+            print()
+
+            print("EMBEDDING GENERATION")
+            embed_and_store_pdfs(collection, embedding_model)
+            print()
+
+        end_time = datetime.now()
+        duration = end_time - start_time
+        print("=" * 60)
+        print("TRAINING COMPLETE")
+        print("=" * 60)
+        print(f"Finished: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Duration: {duration}")
+        print(f"Database location: {ENGINE_DIR}")
+
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user")
+    except Exception as e:
+        print(f"\nTraining failed with error: {e}")
+        raise
+
+if __name__ == "__main__":
+    main()
