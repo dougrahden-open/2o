@@ -223,16 +223,14 @@ def prepare_pdfs():
     print(f"Prepared {len(latest_pdfs)} PDFs in {PREPPED_PDFS_DIR}")
     return latest_pdfs
 
-# %% Cell 6: Model and Database Initialization (FP16 for A6000/A40)
+# %% Cell 6: Model and Database Initialization (FP16-safe)
 
-from transformers import AutoModel, AutoTokenizer
 from sentence_transformers import SentenceTransformer
 
 def setup_models():
-    """Initialize ChromaDB and load BGE embedding model with FP16 support"""
+    """Initialize ChromaDB and load BGE embedding model with A6000 optimizations"""
     print("Setting up models and database...")
 
-    # GPU status
     if torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name(0)
         vram = torch.cuda.get_device_properties(0).total_memory / 1e9
@@ -240,9 +238,8 @@ def setup_models():
         print(f"Using FP16: {USE_FP16}")
         print(f"Embedding Batch Size: {EMBEDDING_BATCH_SIZE}")
     else:
-        print("WARNING: CUDA not available — using CPU fallback")
+        print("WARNING: CUDA not available — using CPU")
 
-    # Initialize ChromaDB
     chroma_client = chromadb.PersistentClient(path=str(ENGINE_DIR))
     try:
         chroma_client.delete_collection(COLLECTION_NAME)
@@ -252,20 +249,21 @@ def setup_models():
 
     collection = chroma_client.create_collection(name=COLLECTION_NAME)
 
-    # Load embedding model with FP16 optimization
+    # Load model
     print(f"Loading embedding model from: {BGE_MODEL_PATH}")
-    if USE_FP16 and torch.cuda.is_available():
-        model = AutoModel.from_pretrained(str(BGE_MODEL_PATH), torch_dtype=torch.float16)
-        tokenizer = AutoTokenizer.from_pretrained(str(BGE_MODEL_PATH))
-        embedding_model = SentenceTransformer(modules=[tokenizer, model])
-        print("Model loaded in FP16")
-    else:
-        embedding_model = SentenceTransformer(str(BGE_MODEL_PATH))
-        print("Model loaded in default precision")
+    embedding_model = SentenceTransformer(
+        str(BGE_MODEL_PATH),
+        device='cuda' if torch.cuda.is_available() else 'cpu'
+    )
 
-    # Warm up
+    # Cast model to half precision if on GPU
+    if USE_FP16 and torch.cuda.is_available():
+        embedding_model._target_device = torch.device("cuda")
+        embedding_model.model = embedding_model.model.half()
+        print("Model cast to FP16")
+
     print("Warming up model...")
-    _ = embedding_model.encode(["Warm-up embedding to activate model"])
+    _ = embedding_model.encode(["Warm-up embedding"])
     print("Model ready.")
 
     return collection, embedding_model
