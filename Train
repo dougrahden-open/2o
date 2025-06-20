@@ -112,6 +112,69 @@ def get_latest_pdfs():
 
 # %% Cell 5: PDF Preparation and Update Detection
 
+def get_latest_pdfs():
+    """Get the latest version of each PDF based on suffix + mod time"""
+    print("Scanning for PDFs...")
+    pdf_groups = {}
+
+    for pdf_file in RAW_PDFS_DIR.glob("*.pdf"):
+        filename = pdf_file.stem
+        mod_time = pdf_file.stat().st_mtime
+        
+        if re.match(r".*_[A-Z]$", filename):
+            base_name = filename[:-2]
+            suffix = ord(filename[-1]) - ord("A")
+            suffix_type = "letter"
+        elif re.match(r".*_\d+$", filename):
+            parts = filename.rsplit("_", 1)
+            base_name = parts[0]
+            suffix = int(parts[1])
+            suffix_type = "number"
+        else:
+            base_name = filename
+            suffix = -1
+            suffix_type = "base"
+        
+        pdf_groups.setdefault(base_name, []).append((suffix_type, suffix, mod_time, pdf_file))
+
+    if not pdf_groups:
+        print(f"No PDFs found in {RAW_PDFS_DIR}")
+        return []
+
+    total_files = sum(len(v) for v in pdf_groups.values())
+    print(f"Found {total_files} total PDF files across {len(pdf_groups)} base documents")
+
+    latest_pdfs = []
+    for base_name, versions in pdf_groups.items():
+        def sort_key(item):
+            suffix_type, suffix, mod_time, _ = item
+            if suffix_type == "number":
+                return (2, suffix, mod_time)
+            elif suffix_type == "letter":
+                return (1, suffix, mod_time)
+            else:
+                return (0, suffix, mod_time)
+
+        sorted_versions = sorted(versions, key=sort_key, reverse=True)
+        latest_file = sorted_versions[0][3]
+        latest_type = sorted_versions[0][0]
+        latest_suffix = sorted_versions[0][1]
+
+        suffix_desc = (
+            f"_{latest_suffix}" if latest_type == "number" else
+            f"_{chr(latest_suffix + ord('A'))}" if latest_type == "letter" else
+            "(base)"
+        )
+
+        latest_pdfs.append(latest_file)
+        skipped = sorted_versions[1:]
+        print(f"Selected: {latest_file.name} {suffix_desc} (skipped {len(skipped)} other versions)")
+        for _, _, _, skipped_file in skipped:
+            print(f"  - Skipped: {skipped_file.name}")
+
+    return latest_pdfs
+
+
 def prepare_pdfs():
     """Copy latest PDFs to prepped directory, only if updates are needed"""
     latest_pdfs = get_latest_pdfs()
@@ -119,29 +182,39 @@ def prepare_pdfs():
         print("No PDFs found in raw directory!")
         return []
 
+    print(f"\nFinal selection: {len(latest_pdfs)} unique PDFs will be used for embedding.")
+
     existing_prepped = list(PREPPED_PDFS_DIR.glob("*.pdf")) if PREPPED_PDFS_DIR.exists() else []
 
-    needs_update = (
-        len(existing_prepped) != len(latest_pdfs)
-        or {f.name for f in existing_prepped} != {f.name for f in latest_pdfs}
-    )
+    needs_update = False
+
+    if len(existing_prepped) != len(latest_pdfs):
+        needs_update = True
+        print(f"Prepped directory file count changed: {len(existing_prepped)} → {len(latest_pdfs)}")
+    else:
+        existing_names = {f.name for f in existing_prepped}
+        latest_names = {f.name for f in latest_pdfs}
+        
+        if existing_names != latest_names:
+            needs_update = True
+            print("Prepped directory file names differ from selected latest PDFs")
+        else:
+            for latest_pdf in latest_pdfs:
+                prepped_file = PREPPED_PDFS_DIR / latest_pdf.name
+                if not prepped_file.exists() or latest_pdf.stat().st_mtime > prepped_file.stat().st_mtime:
+                    needs_update = True
+                    print(f"Newer or missing file detected: {latest_pdf.name}")
+                    break
 
     if not needs_update:
-        for latest_pdf in latest_pdfs:
-            prepped_file = PREPPED_PDFS_DIR / latest_pdf.name
-            if not prepped_file.exists() or latest_pdf.stat().st_mtime > prepped_file.stat().st_mtime:
-                needs_update = True
-                break
-
-    if not needs_update:
-        print("No updates needed - all files are current")
+        print("No updates needed — all PDFs already prepped and current.")
         return latest_pdfs
 
     if PREPPED_PDFS_DIR.exists():
         shutil.rmtree(PREPPED_PDFS_DIR)
     PREPPED_PDFS_DIR.mkdir(parents=True, exist_ok=True)
 
-    print("Copying latest PDFs...")
+    print(f"\nCopying {len(latest_pdfs)} selected PDFs to prepped-pdfs...")
     for pdf_file in latest_pdfs:
         dest_path = PREPPED_PDFS_DIR / pdf_file.name
         shutil.copy2(pdf_file, dest_path)
