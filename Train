@@ -223,12 +223,12 @@ def prepare_pdfs():
     print(f"Prepared {len(latest_pdfs)} PDFs in {PREPPED_PDFS_DIR}")
     return latest_pdfs
 
-# %% Cell 6: Model and Database Initialization (FP16-safe)
+# %% Cell 6: Model and Database Initialization (Robust FP16 for A6000/A40)
 
 from sentence_transformers import SentenceTransformer
 
 def setup_models():
-    """Initialize ChromaDB and load BGE embedding model with A6000 optimizations"""
+    """Initialize ChromaDB and load BGE embedding model with optional FP16 casting"""
     print("Setting up models and database...")
 
     if torch.cuda.is_available():
@@ -249,18 +249,17 @@ def setup_models():
 
     collection = chroma_client.create_collection(name=COLLECTION_NAME)
 
-    # Load model
     print(f"Loading embedding model from: {BGE_MODEL_PATH}")
-    embedding_model = SentenceTransformer(
-        str(BGE_MODEL_PATH),
-        device='cuda' if torch.cuda.is_available() else 'cpu'
-    )
+    embedding_model = SentenceTransformer(str(BGE_MODEL_PATH))
 
-    # Cast model to half precision if on GPU
     if USE_FP16 and torch.cuda.is_available():
-        embedding_model._target_device = torch.device("cuda")
-        embedding_model.model = embedding_model.model.half()
-        print("Model cast to FP16")
+        # Cast all transformer submodules to half precision
+        for module in embedding_model._modules.values():
+            try:
+                module.to(dtype=torch.float16, device='cuda')
+            except Exception as e:
+                print(f"  Skipped casting module {module.__class__.__name__}: {e}")
+        print("Model cast to FP16 where supported")
 
     print("Warming up model...")
     _ = embedding_model.encode(["Warm-up embedding"])
