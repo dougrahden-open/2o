@@ -15,7 +15,8 @@ dependencies:
   - pip
   - setuptools
   - wheel
-  - ipykernel
+  - ipykernel           # Enables kernel support in Jupyter
+  - notebook            # Jupyter Notebook interface
   - pip:
       - sentence-transformers==2.7.0
       - chromadb==0.4.24
