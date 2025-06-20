@@ -25,13 +25,16 @@ ENGINE_DIR = BASE_DIR / "Engine"
 BGE_MODEL_PATH = MODELS_DIR / "bge-large-en-v15"
 COLLECTION_NAME = "pdf_collection"
 
+print("[Setup] Base directories and model paths initialized")
+
 # %% Cell 3: Directory Setup Functions
 
 def setup_directories():
     """Create all necessary directories if they don’t exist"""
     for directory in [INPUTS_DIR, RAW_PDFS_DIR, PREPPED_PDFS_DIR, ENGINE_DIR]:
         directory.mkdir(parents=True, exist_ok=True)
-    print(f"Directories set up in: {BASE_DIR}")
+        print(f"[Setup] Ensured directory exists: {directory}")
+    print(f"[Setup] All directories created or already exist in: {BASE_DIR}")
 
 # %% Cell 4: PDF Selection Logic with Version Control
 
@@ -42,6 +45,7 @@ def get_latest_pdfs():
     2. File modification date (newest wins)
     """
     pdf_groups = {}
+    print("[PDF Selection] Scanning for PDFs in:", RAW_PDFS_DIR)
 
     for pdf_file in RAW_PDFS_DIR.glob("*.pdf"):
         filename = pdf_file.stem
@@ -67,6 +71,7 @@ def get_latest_pdfs():
         pdf_groups[base_name].append((suffix_type, suffix, mod_time, pdf_file))
 
     latest_pdfs = []
+    print("[PDF Selection] Grouping and selecting latest versions...")
     for base_name, versions in pdf_groups.items():
         def sort_key(item):
             suffix_type, suffix, mod_time, file_path = item
@@ -90,7 +95,7 @@ def get_latest_pdfs():
             suffix_desc = "(base)"
 
         latest_pdfs.append(latest_file)
-        print(f"Selected: {latest_file.name} {suffix_desc} (from {len(versions)} versions)")
+        print(f"[PDF Selection] Selected: {latest_file.name} {suffix_desc} (from {len(versions)} versions)")
 
     return latest_pdfs
 
@@ -98,26 +103,28 @@ def get_latest_pdfs():
 
 def prepare_pdfs():
     """Copy latest PDFs to prepped directory, only if updates are needed"""
+    print("[Prep] Checking for latest PDFs...")
     latest_pdfs = get_latest_pdfs()
 
     if not latest_pdfs:
-        print("No PDFs found in raw directory!")
+        print("[Prep] No PDFs found in raw directory!")
         return []
 
     existing_prepped = list(PREPPED_PDFS_DIR.glob("*.pdf")) if PREPPED_PDFS_DIR.exists() else []
+    print(f"[Prep] Found {len(existing_prepped)} existing prepped PDFs")
 
     needs_update = False
 
     if len(existing_prepped) != len(latest_pdfs):
         needs_update = True
-        print(f"File count changed: {len(existing_prepped)} -> {len(latest_pdfs)}")
+        print(f"[Prep] File count changed: {len(existing_prepped)} -> {len(latest_pdfs)}")
     else:
         existing_names = {f.name for f in existing_prepped}
         latest_names = {f.name for f in latest_pdfs}
 
         if existing_names != latest_names:
             needs_update = True
-            print("Different files selected")
+            print("[Prep] File names differ, update required")
         else:
             for latest_pdf in latest_pdfs:
                 prepped_file = PREPPED_PDFS_DIR / latest_pdf.name
@@ -126,25 +133,26 @@ def prepare_pdfs():
                     prepped_mod_time = prepped_file.stat().st_mtime
                     if latest_mod_time > prepped_mod_time:
                         needs_update = True
-                        print(f"Newer version detected: {latest_pdf.name}")
+                        print(f"[Prep] Newer version detected: {latest_pdf.name}")
                         break
                 else:
                     needs_update = True
-                    print(f"Missing file: {latest_pdf.name}")
+                    print(f"[Prep] Missing file: {latest_pdf.name}")
                     break
 
     if not needs_update:
-        print("No updates needed - all files are current")
+        print("[Prep] No updates needed - all files are current")
         return latest_pdfs
 
     if PREPPED_PDFS_DIR.exists():
         shutil.rmtree(PREPPED_PDFS_DIR)
+        print("[Prep] Old prepped directory cleared")
     PREPPED_PDFS_DIR.mkdir(parents=True, exist_ok=True)
 
     for pdf_file in latest_pdfs:
         dest_path = PREPPED_PDFS_DIR / pdf_file.name
         shutil.copy2(pdf_file, dest_path)
-        print(f"Copied: {pdf_file.name}")
+        print(f"[Prep] Copied: {pdf_file.name}")
 
-    print(f"Prepared {len(latest_pdfs)} PDFs in {PREPPED_PDFS_DIR}")
+    print(f"[Prep] Prepared {len(latest_pdfs)} PDFs in {PREPPED_PDFS_DIR}")
     return latest_pdfs
