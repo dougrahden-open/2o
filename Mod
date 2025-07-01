@@ -1,0 +1,428 @@
+# maurogpt2-model.py - Main API Server with BGE Search + OpenChat Analysis
+
+# %% Cell 1: Imports and Dependencies
+
+import os
+import asyncio
+from pathlib import Path
+from typing import List, Dict, Optional
+from datetime import datetime
+from contextlib import asynccontextmanager
+import json
+import sqlite3
+
+import uvicorn
+from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
+
+import chromadb
+from sentence_transformers import SentenceTransformer
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+
+# %% Cell 2: Configuration
+
+BASE_DIR = Path("D:/aa039v2")
+MODELS_DIR = BASE_DIR / "models"
+ENGINE_DIR = BASE_DIR / "Engine"
+TEMPLATES_DIR = BASE_DIR / "templates"
+STATIC_DIR = BASE_DIR / "static"
+
+# Model paths
+BGE_MODEL_PATH = MODELS_DIR / "bge-large-en-v15"
+OPENCHAT_MODEL_PATH = MODELS_DIR / "openchat-35-0106"
+COLLECTION_NAME = "pdf_collection"
+
+# Search settings
+DEFAULT_TOP_K = 20
+DEFAULT_SIMILARITY_CUTOFF = 0.85
+MAX_CONTEXT_TOKENS = 4000
+
+# Server settings
+HOST = "0.0.0.0"
+PORT = 8000
+DEBUG = True
+
+# Global model storage
+models = {}
+
+# %% Cell 3: Data Models
+
+from pydantic import BaseModel
+from typing import List, Dict, Optional
+
+class SearchRequest(BaseModel):
+    question: str
+    top_k: Optional[int] = DEFAULT_TOP_K
+    similarity_cutoff: Optional[float] = DEFAULT_SIMILARITY_CUTOFF
+    include_analysis: Optional[bool] = True
+
+class SearchResult(BaseModel):
+    document: str
+    source_pdf: str
+    page_number: int
+    similarity_score: float
+    chunk_index: int
+
+class SearchResponse(BaseModel):
+    question: str
+    results: List[SearchResult]
+    context_used: str
+    analysis: Optional[str] = None
+    processing_time: float
+    total_results: int
+
+class HealthResponse(BaseModel):
+    status: str
+    models_loaded: Dict[str, bool]
+    database_status: str
+    timestamp: str
+
+# %% Cell 4: Model Loading Functions
+
+async def load_bge_model():
+    """Load BGE embedding model"""
+    print("Loading BGE embedding model...")
+    try:
+        model = SentenceTransformer(str(BGE_MODEL_PATH), device='cuda')
+        print(f"BGE model loaded on device: {model.device}")
+        return model
+    except Exception as e:
+        print(f"Error loading BGE model: {e}")
+        return None
+
+async def load_openchat_model():
+    """Load OpenChat model and tokenizer"""
+    print("Loading OpenChat model...")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(str(OPENCHAT_MODEL_PATH))
+        model = AutoModelForCausalLM.from_pretrained(
+            str(OPENCHAT_MODEL_PATH),
+            torch_dtype=torch.float16,
+            device_map="auto",
+            trust_remote_code=True
+        )
+        print("OpenChat model loaded")
+        return {"model": model, "tokenizer": tokenizer}
+    except Exception as e:
+        print(f"Error loading OpenChat model: {e}")
+        return None
+
+async def load_chromadb():
+    """Connect to ChromaDB"""
+    print("Connecting to ChromaDB...")
+    try:
+        client = chromadb.PersistentClient(path=str(ENGINE_DIR))
+        collection = client.get_collection(COLLECTION_NAME)
+        count = collection.count()
+        print(f"ChromaDB connected: {count:,} embeddings available")
+        return collection
+    except Exception as e:
+        print(f"Error connecting to ChromaDB: {e}")
+        return None
+
+async def load_all_models():
+    """Load all models concurrently"""
+    print("Starting concurrent model load...")
+    bge_task = load_bge_model()
+    openchat_task = load_openchat_model()
+    chromadb_task = load_chromadb()
+
+    bge_model, openchat, chromadb = await asyncio.gather(
+        bge_task, openchat_task, chromadb_task
+    )
+
+    models["bge"] = bge_model
+    models["openchat"] = openchat
+    models["chromadb"] = chromadb
+
+    loaded = sum(1 for m in [bge_model, openchat, chromadb] if m is not None)
+    print(f"Loaded {loaded}/3 models successfully")
+
+# %% Cell 5: Vector Search Functions
+
+def search_documents(
+    question: str,
+    top_k: int = DEFAULT_TOP_K,
+    similarity_cutoff: float = DEFAULT_SIMILARITY_CUTOFF
+) -> Dict:
+    """Search documents using BGE embeddings"""
+    start_time = datetime.now()
+
+    # Get models
+    embedding_model = models.get("bge")
+    collection = models.get("chromadb")
+
+    if not embedding_model or not collection:
+        raise HTTPException(status_code=500, detail="Models not loaded")
+
+    # Generate query embedding
+    query_embedding = embedding_model.encode([question]).tolist()
+
+    # Search ChromaDB
+    results = collection.query(
+        query_embeddings=query_embedding,
+        n_results=min(top_k * 10, 500),  # Over-fetch to filter after
+        include=["documents", "metadatas", "distances"]
+    )
+
+    # Process results
+    documents = results["documents"][0]
+    metadatas = results["metadatas"][0]
+    distances = results["distances"][0]
+
+    search_results = []
+    for doc, meta, dist in zip(documents, metadatas, distances):
+        similarity = 1 - dist  # Convert distance to similarity
+        if similarity >= similarity_cutoff:
+            search_results.append({
+                "document": doc,
+                "source_pdf": meta.get("source_pdf", "unknown"),
+                "page_number": meta.get("page_number", 0),
+                "chunk_index": meta.get("chunk_index", 0),
+                "similarity_score": similarity,
+                "word_count": meta.get("word_count", 0)
+            })
+
+    # Sort and trim to top_k
+    search_results.sort(key=lambda x: x["similarity_score"], reverse=True)
+    search_results = search_results[:top_k]
+
+    # Build context string (respecting token limit)
+    context_lines = []
+    tokens_used = 0
+    for result in search_results:
+        filename = result["source_pdf"]
+        page = result["page_number"]
+        similarity = result["similarity_score"]
+
+        line = f"[{filename} | page {page} | similarity {similarity:.4f}]\n{result['document'].strip()}"
+        estimated_tokens = len(line.split()) * 1.3  # Rough estimate
+
+        if tokens_used + estimated_tokens > MAX_CONTEXT_TOKENS:
+            break
+
+        context_lines.append(line)
+        tokens_used += estimated_tokens
+
+    context_text = "\n\n".join(context_lines)
+    processing_time = (datetime.now() - start_time).total_seconds()
+
+    return {
+        "results": search_results,
+        "context": context_text,
+        "processing_time": processing_time,
+        "total_results": len(search_results)
+    }
+
+# %% Cell 6: OpenChat Analysis Functions
+
+def analyze_with_openchat(question: str, context: str) -> str:
+    """Generate analysis using OpenChat model"""
+    openchat = models.get("openchat")
+    if not openchat:
+        return "OpenChat model not available"
+
+    model = openchat["model"]
+    tokenizer = openchat["tokenizer"]
+
+    # Build prompt (tightened format)
+    prompt = (
+        "Analyze the following technical context.\n\n"
+        "Output the following sections:\n"
+        "1. Best Matching Documents\n"
+        "2. Technical Analysis\n"
+        "3. Key Findings\n\n"
+        "Context:\n"
+        f"{context}\n\n"
+        f"User Question: {question}\n\n"
+        "Analysis:"
+    )
+
+    try:
+        inputs = tokenizer.encode(
+            prompt,
+            return_tensors="pt",
+            max_length=4000,
+            truncation=True
+        )
+
+        with torch.no_grad():
+            outputs = model.generate(
+                inputs,
+                max_new_tokens=1000,
+                temperature=0.1,
+                do_sample=True,
+                pad_token_id=tokenizer.eos_token_id,
+                eos_token_id=tokenizer.eos_token_id
+            )
+
+        decoded_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        prompt_trimmed = tokenizer.decode(inputs[0], skip_special_tokens=True)
+        analysis = decoded_output[len(prompt_trimmed):].strip()
+
+        return analysis
+
+    except Exception as e:
+        return f"Error generating analysis: {str(e)}"
+
+# %% Cell 7: API Endpoints
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load models on startup"""
+    print("Starting MauroGPT2 Model Server...")
+    await load_all_models()
+    yield
+    print("Shutting down MauroGPT2 Model Server...")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+# Create FastAPI app
+app = FastAPI(
+    title="MauroGPT2 Model Server",
+    description="BGE Vector Search + OpenChat Analysis for Technical Documents",
+    version="2.0.0",
+    lifespan=lifespan
+)
+
+# Health check endpoint
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    """Health check endpoint"""
+    models_status = {
+        "bge": models.get("bge") is not None,
+        "openchat": models.get("openchat") is not None,
+        "chromadb": models.get("chromadb") is not None
+    }
+    db_status = "connected" if models.get("chromadb") else "disconnected"
+
+    return HealthResponse(
+        status="healthy" if all(models_status.values()) else "degraded",
+        models_loaded=models_status,
+        database_status=db_status,
+        timestamp=datetime.now().isoformat()
+    )
+
+# Search endpoint
+@app.post("/api/search", response_model=SearchResponse)
+async def search_endpoint(request: SearchRequest):
+    """Main search endpoint"""
+    try:
+        search_data = search_documents(
+            question=request.question,
+            top_k=request.top_k,
+            similarity_cutoff=request.similarity_cutoff
+        )
+
+        search_results = [
+            SearchResult(**result) for result in search_data["results"]
+        ]
+
+        analysis = None
+        if request.include_analysis and search_data["context"]:
+            analysis = analyze_with_openchat(request.question, search_data["context"])
+
+        return SearchResponse(
+            question=request.question,
+            results=search_results,
+            context_used=search_data["context"],
+            analysis=analysis,
+            processing_time=search_data["processing_time"],
+            total_results=search_data["total_results"]
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Simple web interface endpoint
+@app.get("/", response_class=HTMLResponse)
+async def web_interface():
+    """Simple web interface"""
+    html_content = """
+<!DOCTYPE html>
+<html>
+<head>
+<title>MauroGPT2 - Technical Document Search</title>
+<style>
+body { font-family: Arial, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; }
+.search-box { width: 100%; padding: 10px; font-size: 16px; margin-bottom: 20px; }
+.search-btn { padding: 10px 20px; font-size: 16px; background: #007cba; color: white; border: none; cursor: pointer; }
+.result { border: 1px solid #ddd; margin: 10px 0; padding: 15px; border-radius: 5px; }
+.result-header { font-weight: bold; color: #007cba; margin-bottom: 10px; }
+.analysis { background: #f0f8ff; padding: 15px; border-radius: 5px; margin: 20px 0; }
+.loading { color: #666; font-style: italic; }
+</style>
+</head>
+<body>
+<h1>MauroGPT2 - Technical Document Search</h1>
+<div>
+<input type="text" id="question" class="search-box" placeholder="Enter your technical question..." />
+<button onclick="search()" class="search-btn">Search</button>
+</div>
+<div id="results"></div>
+<script>
+    async function search() {
+        const question = document.getElementById('question').value;
+        if (!question.trim()) return;
+        document.getElementById('results').innerHTML = '<div class="loading">Searching...</div>';
+        try {
+            const response = await fetch('/api/search', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ question: question, include_analysis: true })
+            });
+            const data = await response.json();
+            displayResults(data);
+        } catch (error) {
+            document.getElementById('results').innerHTML = '<div>Error: ' + error.message + '</div>';
+        }
+    }
+    function displayResults(data) {
+        let html = '<h3>Search Results (' + data.total_results + ' found)</h3>';
+        if (data.analysis) {
+            html += '<div class="analysis"><h4>AI Analysis:</h4>' + data.analysis.replace(/\\n/g, '<br>') + '</div>';
+        }
+        data.results.forEach(result => {
+            html += '<div class="result">';
+            html += '<div class="result-header">' + result.source_pdf + ' (Page ' + result.page_number + ') - Similarity: ' + result.similarity_score.toFixed(3) + '</div>';
+            html += '<div>' + result.document + '</div>';
+            html += '</div>';
+        });
+        document.getElementById('results').innerHTML = html;
+    }
+    document.getElementById('question').addEventListener('keypress', function(e) {
+        if (e.key === 'Enter') search();
+    });
+</script>
+</body>
+</html>
+"""
+    return HTMLResponse(content=html_content)
+
+# %% Cell 8: Main Server Function
+
+def main():
+    """Main server function"""
+    print("=" * 60)
+    print("MAUROGPT2 MODEL SERVER")
+    print("=" * 60)
+    print(f"Base Directory: {BASE_DIR}")
+    print(f"BGE Model: {BGE_MODEL_PATH}")
+    print(f"OpenChat Model: {OPENCHAT_MODEL_PATH}")
+    print(f"Server: http://{HOST}:{PORT}")
+    print("=" * 60)
+
+    uvicorn.run(
+        "maurogpt2-model:app",
+        host=HOST,
+        port=PORT,
+        reload=DEBUG,
+        log_level="info"
+    )
+
+if __name__ == "__main__":
+    main()
