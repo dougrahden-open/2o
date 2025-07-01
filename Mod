@@ -25,7 +25,9 @@ import torch
 
 # %% Cell 2: Configuration
 
-BASE_DIR = Path("D:/aa039v2")
+import os
+
+BASE_DIR = Path(os.environ.get("MAUROGPT2_BASE", "D:/aa039v2"))
 MODELS_DIR = BASE_DIR / "models"
 ENGINE_DIR = BASE_DIR / "Engine"
 TEMPLATES_DIR = BASE_DIR / "templates"
@@ -45,6 +47,9 @@ MAX_CONTEXT_TOKENS = 4000
 HOST = "0.0.0.0"
 PORT = 8000
 DEBUG = True
+
+# Global model storage
+models = {}
 
 # Global model storage
 models = {}
