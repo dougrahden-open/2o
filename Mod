@@ -38,7 +38,7 @@ COLLECTION_NAME = "pdf_collection"
 
 # Search settings
 DEFAULT_TOP_K = 20
-DEFAULT_SIMILARITY_CUTOFF = 0.85
+DEFAULT_SIMILARITY_CUTOFF = 0.3
 MAX_CONTEXT_TOKENS = 4000
 
 # Server settings
@@ -86,6 +86,10 @@ class HealthResponse(BaseModel):
 async def load_bge_model():
     """Load BGE embedding model"""
     print("Loading BGE embedding model...")
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required but not available for BGE model")
+
     try:
         model = SentenceTransformer(str(BGE_MODEL_PATH), device='cuda')
         print(f"BGE model loaded on device: {model.device}")
@@ -97,16 +101,26 @@ async def load_bge_model():
 async def load_openchat_model():
     """Load OpenChat model and tokenizer"""
     print("Loading OpenChat model...")
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required but not available for OpenChat model")
+
     try:
         tokenizer = AutoTokenizer.from_pretrained(str(OPENCHAT_MODEL_PATH))
         model = AutoModelForCausalLM.from_pretrained(
             str(OPENCHAT_MODEL_PATH),
             torch_dtype=torch.float16,
-            device_map="auto",
+            device_map={"": "cuda"},  # Load entire model onto single GPU
             trust_remote_code=True
         )
         print("OpenChat model loaded")
         return {"model": model, "tokenizer": tokenizer}
+
+    except RuntimeError as e:
+        if "CUDA out of memory" in str(e):
+            raise RuntimeError("CUDA out of memory while loading OpenChat model. Try reducing model size or increasing GPU memory.")
+        raise  # Propagate other runtime errors
+
     except Exception as e:
         print(f"Error loading OpenChat model: {e}")
         return None
@@ -127,6 +141,7 @@ async def load_chromadb():
 async def load_all_models():
     """Load all models concurrently"""
     print("Starting concurrent model load...")
+
     bge_task = load_bge_model()
     openchat_task = load_openchat_model()
     chromadb_task = load_chromadb()
