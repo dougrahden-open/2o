@@ -38,7 +38,7 @@ COLLECTION_NAME = "pdf_collection"
 
 # Search settings
 DEFAULT_TOP_K = 20
-DEFAULT_SIMILARITY_CUTOFF = 0.3
+DEFAULT_SIMILARITY_CUTOFF = 0.2
 MAX_CONTEXT_TOKENS = 4000
 
 # Server settings
@@ -269,9 +269,10 @@ def analyze_with_openchat(question: str, context: str) -> str:
         with torch.no_grad():
             outputs = model.generate(
                 inputs,
-                max_new_tokens=1000,
+                max_new_tokens=500,
                 temperature=0.1,
-                do_sample=True,
+                do_sample=False,
+                num_beams=1,
                 pad_token_id=tokenizer.eos_token_id,
                 eos_token_id=tokenizer.eos_token_id
             )
