@@ -1,0 +1,56 @@
+dockerfile
+# Use NVIDIA CUDA base image with Python
+FROM nvidia/cuda:11.8-devel-ubuntu22.04
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    python3-dev \
+    build-essential \
+    cmake \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set Python alias
+RUN ln -s /usr/bin/python3 /usr/bin/python
+
+# Copy requirements first (for better caching)
+COPY maurogpt2-environment.yml .
+
+# Install conda (lightweight version)
+RUN pip install --no-cache-dir \
+    torch==2.1.0 \
+    torchvision==0.16.0 \
+    torchaudio==2.1.0 \
+    --index-url https://download.pytorch.org/whl/cu118
+
+# Install Python dependencies
+RUN pip install --no-cache-dir \
+    sentence-transformers==2.7.0 \
+    chromadb==0.4.24 \
+    PyPDF2==3.0.1 \
+    fastapi==0.104.1 \
+    uvicorn[standard]==0.24.0 \
+    transformers==4.36.0 \
+    accelerate==0.25.0 \
+    llama-cpp-python \
+    jinja2==3.1.2 \
+    python-multipart==0.0.6
+
+# Copy application code
+COPY scripts/ ./scripts/
+COPY models/ ./models/
+COPY Engine/ ./Engine/
+
+# Set environment variable for Docker
+ENV MAUROGPT2_BASE=/app
+
+# Expose port
+EXPOSE 8000
+
+# Run the application
+CMD ["python", "scripts/maurogpt2-model.py"]
