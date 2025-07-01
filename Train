@@ -146,9 +146,6 @@ def prepare_pdfs():
     print(f"Prepared {len(latest_pdfs)} PDFs in {PREPPED_PDFS_DIR}")
     return latest_pdfs
 
-# Cells 6â9 omitted for brevity in this cell (to avoid timeout). Will append next.
-
-
 # %% Cell 6: Model and Database Initialization
 
 def setup_models():
@@ -177,15 +174,10 @@ def setup_models():
     print(f"Created fresh collection: {COLLECTION_NAME}")
 
     print(f"Loading BGE model from: {BGE_MODEL_PATH}")
-    model_kwargs = {}
-    if torch.cuda.is_available() and USE_FP16:
-        model_kwargs['torch_dtype'] = torch.float16
-        print("Using FP16 precision for faster GPU inference")
 
     embedding_model = SentenceTransformer(
         str(BGE_MODEL_PATH),
-        device='cuda' if torch.cuda.is_available() else 'cpu',
-        model_kwargs=model_kwargs
+        device='cuda' if torch.cuda.is_available() else 'cpu'
     )
 
     print(f"BGE model loaded on device: {embedding_model.device}")
