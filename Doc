@@ -1,8 +1,8 @@
-FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04
+FROM nvidia/cuda:11.8.0-devel-ubuntu22.04
 
 WORKDIR /app
 
-# Disable SSL verification globally
+# SSL bypass environment variables
 ENV PYTHONHTTPSVERIFY=0
 ENV CURL_CA_BUNDLE=""
 ENV REQUESTS_CA_BUNDLE=""
@@ -14,28 +14,31 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     cmake \
     git \
-    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 RUN ln -s /usr/bin/python3 /usr/bin/python
 
-# Configure pip to ignore SSL completely
+# Configure pip SSL bypass
 RUN pip config set global.trusted-host "pypi.org files.pythonhosted.org pypi.python.org download.pytorch.org"
-RUN pip config set global.cert /dev/null
 
-# Install PyTorch with all SSL bypasses
+# Install llama-cpp-python with CUDA support using CMAKE args
+ENV CMAKE_ARGS="-DGGML_CUDA=on"
 RUN pip install --no-cache-dir \
     --trusted-host pypi.org \
     --trusted-host files.pythonhosted.org \
     --trusted-host pypi.python.org \
-    --trusted-host download.pytorch.org \
-    --disable-pip-version-check \
+    llama-cpp-python
+
+# Install other packages
+RUN pip install --no-cache-dir \
+    --trusted-host pypi.org \
+    --trusted-host files.pythonhosted.org \
+    --trusted-host pypi.python.org \
     torch==2.1.0 \
     torchvision==0.16.0 \
     torchaudio==2.1.0 \
     --index-url https://download.pytorch.org/whl/cu118
 
-# Install other packages with SSL bypass
 RUN pip install --no-cache-dir \
     --trusted-host pypi.org \
     --trusted-host files.pythonhosted.org \
@@ -47,7 +50,6 @@ RUN pip install --no-cache-dir \
     uvicorn[standard]==0.24.0 \
     transformers==4.36.0 \
     accelerate==0.25.0 \
-    llama-cpp-python \
     jinja2==3.1.2 \
     python-multipart==0.0.6
 
