@@ -9,17 +9,20 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     cmake \
     git \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 RUN ln -s /usr/bin/python3 /usr/bin/python
 
-RUN pip install --no-cache-dir \
+# Bypass SSL and install PyTorch
+RUN pip install --no-cache-dir --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host download.pytorch.org \
     torch==2.1.0 \
     torchvision==0.16.0 \
     torchaudio==2.1.0 \
     --index-url https://download.pytorch.org/whl/cu118
 
-RUN pip install --no-cache-dir \
+# Install other dependencies with SSL bypass
+RUN pip install --no-cache-dir --trusted-host pypi.org --trusted-host pypi.python.org \
     sentence-transformers==2.7.0 \
     chromadb==0.4.24 \
     PyPDF2==3.0.1 \
