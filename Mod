@@ -244,7 +244,7 @@ def analyze_with_openchat(question: str, context: str) -> str:
     model = openchat["model"]
     tokenizer = openchat["tokenizer"]
 
-    # Build prompt (tightened format)
+    # Prompt structure
     prompt = (
         "Analyze the following technical context.\n\n"
         "Output the following sections:\n"
@@ -258,12 +258,13 @@ def analyze_with_openchat(question: str, context: str) -> str:
     )
 
     try:
+        # Tokenize and move inputs to same device as model
         inputs = tokenizer.encode(
             prompt,
             return_tensors="pt",
             max_length=4000,
             truncation=True
-        )
+        ).to(model.device)
 
         with torch.no_grad():
             outputs = model.generate(
@@ -275,6 +276,7 @@ def analyze_with_openchat(question: str, context: str) -> str:
                 eos_token_id=tokenizer.eos_token_id
             )
 
+        # Decode and extract generated content
         decoded_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
         prompt_trimmed = tokenizer.decode(inputs[0], skip_special_tokens=True)
         analysis = decoded_output[len(prompt_trimmed):].strip()
