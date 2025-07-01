@@ -192,18 +192,25 @@ def setup_models():
     return collection, embedding_model
 
 # %% Cell 7: PDF Text Extraction Functions
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing
 
 def extract_text_from_pdf(pdf_path):
+    """Extract text from PDF and split into optimized chunks"""
     try:
         reader = PdfReader(pdf_path)
         chunks = []
+        
         for page_num, page in enumerate(reader.pages, 1):
             text = page.extract_text()
-            if text and text.strip():
+            
+            if text.strip():
                 words = text.split()
+                
                 for i in range(0, len(words), CHUNK_SIZE):
                     chunk_words = words[i:i + CHUNK_SIZE]
                     chunk_text = ' '.join(chunk_words)
+                    
                     if len(chunk_text.strip()) > 50:
                         chunks.append({
                             'text': chunk_text,
@@ -212,53 +219,91 @@ def extract_text_from_pdf(pdf_path):
                             'chunk_index': i // CHUNK_SIZE,
                             'word_count': len(chunk_words)
                         })
+        
         return chunks
+    
     except Exception as e:
         print(f"Error processing {pdf_path.name}: {e}")
         return []
 
-# %% Cell 8: Embedding Generation and Storage
-
-def embed_and_store_pdfs(collection, embedding_model):
-    print("Processing PDFs and generating embeddings...")
+def process_pdfs_parallel(pdf_files):
+    """Process multiple PDFs in parallel using all CPU cores"""
+    cpu_count = multiprocessing.cpu_count()
+    # For Xeon W9-3575X (56 cores), use most but not all to avoid system lock
+    max_workers = min(cpu_count - 2, 50)
+    print(f"Using {max_workers} of {cpu_count} CPU cores for PDF processing...")
+    
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        results = list(executor.map(extract_text_from_pdf, pdf_files))
+    
     all_chunks = []
-    pdf_files = list(PREPPED_PDFS_DIR.glob("*.pdf"))
-    for i, pdf_file in enumerate(pdf_files, 1):
-        print(f"Processing ({i}/{len(pdf_files)}): {pdf_file.name}")
-        chunks = extract_text_from_pdf(pdf_file)
+    total_words = 0
+    
+    for i, chunks in enumerate(results, 1):
         all_chunks.extend(chunks)
-        print(f"  Extracted {len(chunks)} chunks ({sum(c['word_count'] for c in chunks):,} words)")
+        chunk_words = sum(chunk['word_count'] for chunk in chunks)
+        total_words += chunk_words
+        
+        if i % 50 == 0:
+            print(f"  Processed {i}/{len(pdf_files)} files ({len(all_chunks):,} chunks so far)")
+    
+    print(f"Parallel processing complete: {len(all_chunks):,} chunks, {total_words:,} words")
+    return all_chunks
 
+# %% Cell 8: Embedding Generation and Storage
+def embed_and_store_pdfs(collection, embedding_model):
+    """Process all prepped PDFs and store embeddings with A6000 optimizations"""
+    print("Processing PDFs and generating embeddings...")
+    
+    # Get all PDF files
+    pdf_files = list(PREPPED_PDFS_DIR.glob("*.pdf"))
+    print(f"Found {len(pdf_files)} PDF files to process")
+    
+    # Extract text from all PDFs using parallel processing
+    all_chunks = process_pdfs_parallel(pdf_files)
+    
     if not all_chunks:
         print("No chunks to embed!")
         return
 
     total_words = sum(chunk['word_count'] for chunk in all_chunks)
     print(f"Total: {len(all_chunks):,} chunks, {total_words:,} words")
+
+    # Generate embeddings with A6000 optimizations
     texts = [chunk['text'] for chunk in all_chunks]
     print(f"Generating embeddings with batch size {EMBEDDING_BATCH_SIZE}...")
 
+    # Clear GPU cache before embedding
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         gc.collect()
 
     start_time = datetime.now()
+
     embeddings = embedding_model.encode(
-        texts,
+        texts, 
         show_progress_bar=True,
         batch_size=EMBEDDING_BATCH_SIZE,
         convert_to_tensor=True,
         normalize_embeddings=True,
         device='cuda' if torch.cuda.is_available() else 'cpu'
     )
+
     embedding_time = datetime.now() - start_time
 
+    # Convert to CPU and numpy for ChromaDB storage
     if torch.cuda.is_available():
         embeddings = embeddings.cpu().numpy()
 
     print(f"Generated embeddings: {embeddings.shape} in {embedding_time}")
     print(f"Speed: {len(all_chunks) / embedding_time.total_seconds():.1f} chunks/second")
 
+    # Show GPU memory usage
+    if torch.cuda.is_available():
+        gpu_memory_used = torch.cuda.memory_allocated(0) / (1024**3)
+        print(f"GPU Memory during embedding: {gpu_memory_used:.1f}GB")
+
+    # Prepare data for ChromaDB
     documents = texts
     metadatas = [{
         'source_pdf': chunk['source_pdf'],
@@ -266,26 +311,36 @@ def embed_and_store_pdfs(collection, embedding_model):
         'chunk_index': chunk['chunk_index'],
         'word_count': chunk['word_count']
     } for chunk in all_chunks]
-    ids = [f"{chunk['source_pdf']}_{chunk['page_number']}_{chunk['chunk_index']}"
+    ids = [f"{chunk['source_pdf']}_{chunk['page_number']}_{chunk['chunk_index']}" 
            for chunk in all_chunks]
 
+    # Store in ChromaDB in batches to avoid memory issues
     total_chunks = len(all_chunks)
     num_batches = (total_chunks + STORAGE_BATCH_SIZE - 1) // STORAGE_BATCH_SIZE
 
     print(f"Storing embeddings in {num_batches} batches of {STORAGE_BATCH_SIZE}...")
 
     for i in range(0, total_chunks, STORAGE_BATCH_SIZE):
+        batch_num = i // STORAGE_BATCH_SIZE + 1
         end_idx = min(i + STORAGE_BATCH_SIZE, total_chunks)
+
+        batch_docs = documents[i:end_idx]
+        batch_embeddings = embeddings[i:end_idx].tolist()
+        batch_metadatas = metadatas[i:end_idx]
+        batch_ids = ids[i:end_idx]
+
         collection.add(
-            documents=documents[i:end_idx],
-            embeddings=embeddings[i:end_idx].tolist(),
-            metadatas=metadatas[i:end_idx],
-            ids=ids[i:end_idx]
+            documents=batch_docs,
+            embeddings=batch_embeddings,
+            metadatas=batch_metadatas,
+            ids=batch_ids
         )
-        print(f"  Stored batch {(i // STORAGE_BATCH_SIZE) + 1}/{num_batches} ({end_idx - i} chunks)")
+
+        print(f"  Stored batch {batch_num}/{num_batches} ({end_idx - i} chunks)")
 
     print(f"Successfully stored {len(all_chunks):,} embeddings!")
 
+    # Clear GPU cache after processing
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         gc.collect()
