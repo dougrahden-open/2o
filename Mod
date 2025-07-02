@@ -439,6 +439,142 @@ async def search_endpoint(request: SearchRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# Web interface endpoint
+@app.get("/", response_class=HTMLResponse)
+async def web_interface():
+    """Enhanced web interface with structured analysis display"""
+    html_content = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>MauroGPT2 - Technical Document Search</title>
+        <style>
+            body { font-family: Arial, sans-serif; max-width: 1400px; margin: 0 auto; padding: 20px; }
+            .search-box { width: 70%; padding: 12px; font-size: 16px; margin-bottom: 20px; border: 2px solid #ddd; border-radius: 5px; }
+            .search-btn { padding: 12px 24px; font-size: 16px; background: #007cba; color: white; border: none; cursor: pointer; border-radius: 5px; margin-left: 10px; }
+            .search-btn:hover { background: #005a87; }
+            .controls { margin-bottom: 20px; }
+            .checkbox { margin-right: 20px; }
+            .analysis-container { background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 8px; padding: 20px; margin: 20px 0; }
+            .analysis-section { margin-bottom: 15px; }
+            .analysis-section h4 { margin: 0 0 8px 0; color: #007cba; font-size: 14px; font-weight: bold; text-transform: uppercase; }
+            .summary { background: #e3f2fd; padding: 12px; border-radius: 5px; border-left: 4px solid #2196f3; }
+            .confidence { background: #f3e5f5; padding: 12px; border-radius: 5px; border-left: 4px solid #9c27b0; }
+            .confidence-high { border-left-color: #4caf50; background: #e8f5e8; }
+            .confidence-medium { border-left-color: #ff9800; background: #fff3e0; }
+            .confidence-low { border-left-color: #f44336; background: #ffebee; }
+            .better-prompt { background: #fff3e0; padding: 12px; border-radius: 5px; border-left: 4px solid #ff9800; }
+            .key-pdfs { background: #e8f5e8; padding: 12px; border-radius: 5px; border-left: 4px solid #4caf50; }
+            .pdf-list { margin: 8px 0; }
+            .pdf-item { display: inline-block; background: #007cba; color: white; padding: 4px 8px; margin: 2px; border-radius: 3px; font-size: 12px; }
+            .result { border: 1px solid #ddd; margin: 10px 0; padding: 15px; border-radius: 5px; }
+            .result-header { font-weight: bold; color: #007cba; margin-bottom: 10px; }
+            .loading { color: #666; font-style: italic; text-align: center; padding: 40px; }
+            .stats { color: #666; margin: 10px 0; font-size: 14px; }
+        </style>
+    </head>
+    <body>
+        <h1>MauroGPT2 - Technical Document Search</h1>
+        <div>
+            <input type="text" id="question" class="search-box" placeholder="Enter your technical question..." />
+            <button onclick="search()" class="search-btn">Search</button>
+        </div>
+        <div class="controls">
+            <label class="checkbox"><input type="checkbox" id="includeAnalysis" checked> Include AI Analysis</label>
+        </div>
+        <div id="results"></div>
+        <script>
+            async function search() {
+                const question = document.getElementById('question').value;
+                if (!question.trim()) return;
+
+                const includeAnalysis = document.getElementById('includeAnalysis').checked;
+
+                document.getElementById('results').innerHTML = '<div class="loading">Searching and analyzing...</div>';
+
+                try {
+                    const response = await fetch('/api/search', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ 
+                            question: question, 
+                            include_analysis: includeAnalysis
+                        })
+                    });
+
+                    const data = await response.json();
+                    displayResults(data);
+                } catch (error) {
+                    document.getElementById('results').innerHTML = '<div style="color: red;">Error: ' + error.message + '</div>';
+                }
+            }
+
+            function getConfidenceClass(confidence) {
+                if (confidence >= 0.7) return 'confidence-high';
+                if (confidence >= 0.4) return 'confidence-medium';
+                return 'confidence-low';
+            }
+
+            function displayResults(data) {
+                let html = '<div class="stats"><strong>' + data.total_results + '</strong> results found in <strong>' + data.processing_time.toFixed(2) + 's</strong></div>';
+
+                if (data.analysis) {
+                    const analysis = data.analysis;
+                    const confidenceClass = getConfidenceClass(analysis.confidence_probability);
+                    const confidencePercent = Math.round(analysis.confidence_probability * 100);
+
+                    html += '<div class="analysis-container">';
+                    html += '<h3>AI Analysis</h3>';
+
+                    html += '<div class="analysis-section">';
+                    html += '<h4>Summary</h4>';
+                    html += '<div class="summary">' + analysis.summary + '</div>';
+                    html += '</div>';
+
+                    html += '<div class="analysis-section">';
+                    html += '<h4>Confidence Level</h4>';
+                    html += '<div class="confidence ' + confidenceClass + '"><strong>' + confidencePercent + '%</strong> confident in this answer</div>';
+                    html += '</div>';
+
+                    html += '<div class="analysis-section">';
+                    html += '<h4>Suggested Better Prompt</h4>';
+                    html += '<div class="better-prompt">' + analysis.suggested_better_prompt + '</div>';
+                    html += '</div>';
+
+                    if (analysis.key_source_pdfs && analysis.key_source_pdfs.length > 0) {
+                        html += '<div class="analysis-section">';
+                        html += '<h4>Key Source PDFs</h4>';
+                        html += '<div class="key-pdfs"><div class="pdf-list">';
+                        analysis.key_source_pdfs.forEach(pdf => {
+                            html += '<span class="pdf-item">' + pdf + '</span>';
+                        });
+                        html += '</div></div></div>';
+                    }
+
+                    html += '</div>';
+                }
+
+                html += '<h3>Search Results</h3>';
+
+                data.results.forEach(result => {
+                    html += '<div class="result">';
+                    html += '<div class="result-header">' + result.source_pdf + ' (Page ' + result.page_number + ') - Similarity: ' + result.similarity_score.toFixed(3) + '</div>';
+                    html += '<div>' + result.document + '</div>';
+                    html += '</div>';
+                });
+
+                document.getElementById('results').innerHTML = html;
+            }
+
+            document.getElementById('question').addEventListener('keypress', function(e) {
+                if (e.key === 'Enter') search();
+            });
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
 # %% Cell 8: Main Server Function
 
 def main():
