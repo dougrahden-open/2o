@@ -10,6 +10,7 @@ from datetime import datetime
 from contextlib import asynccontextmanager
 import json
 import sqlite3
+import re
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Depends, Request
@@ -24,8 +25,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 
 # %% Cell 2: Configuration
-
-import os
 
 BASE_DIR = Path(os.environ.get("MAUROGPT2_BASE", "D:/aa039v2"))
 MODELS_DIR = BASE_DIR / "models"
@@ -51,13 +50,7 @@ DEBUG = True
 # Global model storage
 models = {}
 
-# Global model storage
-models = {}
-
-# %% Cell 3: Data Models
-
-from pydantic import BaseModel
-from typing import List, Dict, Optional
+# %% Cell 3: Enhanced Data Models
 
 class SearchRequest(BaseModel):
     question: str
@@ -72,11 +65,17 @@ class SearchResult(BaseModel):
     similarity_score: float
     chunk_index: int
 
+class AnalysisResult(BaseModel):
+    summary: str
+    confidence_probability: float
+    suggested_better_prompt: str
+    key_source_pdfs: List[str]
+
 class SearchResponse(BaseModel):
     question: str
     results: List[SearchResult]
     context_used: str
-    analysis: Optional[str] = None
+    analysis: Optional[AnalysisResult] = None
     processing_time: float
     total_results: int
 
@@ -115,7 +114,7 @@ async def load_openchat_model():
         model = AutoModelForCausalLM.from_pretrained(
             str(OPENCHAT_MODEL_PATH),
             torch_dtype=torch.float16,
-            device_map={"": "cuda"},  # Load entire model onto single GPU
+            device_map={"": "cuda"},  # Force full model to single GPU
             trust_remote_code=True
         )
         print("OpenChat model loaded")
@@ -124,7 +123,7 @@ async def load_openchat_model():
     except RuntimeError as e:
         if "CUDA out of memory" in str(e):
             raise RuntimeError("CUDA out of memory while loading OpenChat model. Try reducing model size or increasing GPU memory.")
-        raise  # Propagate other runtime errors
+        raise
 
     except Exception as e:
         print(f"Error loading OpenChat model: {e}")
@@ -185,11 +184,11 @@ def search_documents(
     # Search ChromaDB
     results = collection.query(
         query_embeddings=query_embedding,
-        n_results=min(top_k * 10, 500),  # Over-fetch to filter after
+        n_results=min(top_k * 10, 500),  # Over-fetch to allow filtering
         include=["documents", "metadatas", "distances"]
     )
 
-    # Process results
+    # Extract results
     documents = results["documents"][0]
     metadatas = results["metadatas"][0]
     distances = results["distances"][0]
@@ -197,6 +196,7 @@ def search_documents(
     search_results = []
     for doc, meta, dist in zip(documents, metadatas, distances):
         similarity = 1 - dist  # Convert distance to similarity
+
         if similarity >= similarity_cutoff:
             search_results.append({
                 "document": doc,
@@ -207,20 +207,21 @@ def search_documents(
                 "word_count": meta.get("word_count", 0)
             })
 
-    # Sort and trim to top_k
+    # Sort by similarity and trim to top_k
     search_results.sort(key=lambda x: x["similarity_score"], reverse=True)
     search_results = search_results[:top_k]
 
-    # Build context string (respecting token limit)
+    # Build context string with token budgeting
     context_lines = []
     tokens_used = 0
+
     for result in search_results:
         filename = result["source_pdf"]
         page = result["page_number"]
         similarity = result["similarity_score"]
 
         line = f"[{filename} | page {page} | similarity {similarity:.4f}]\n{result['document'].strip()}"
-        estimated_tokens = len(line.split()) * 1.3  # Rough estimate
+        estimated_tokens = len(line.split()) * 1.3  # Conservative estimate
 
         if tokens_used + estimated_tokens > MAX_CONTEXT_TOKENS:
             break
@@ -238,43 +239,111 @@ def search_documents(
         "total_results": len(search_results)
     }
 
-# %% Cell 6: OpenChat Analysis Functions
+# %% Cell 6: Enhanced OpenChat Analysis Functions
 
-def analyze_with_openchat(question: str, context: str) -> str:
-    """Generate analysis using OpenChat model"""
+def parse_structured_response(response_text: str) -> AnalysisResult:
+    """Parse the structured response from OpenChat"""
+    summary = "Analysis could not be parsed."
+    confidence = 0.5
+    better_prompt = "Try a more specific technical question."
+    key_pdfs = []
+
+    try:
+        summary_match = re.search(
+            r'SUMMARY:\s*(.*?)(?=\n(?:CONFIDENCE|$))',
+            response_text, re.DOTALL | re.IGNORECASE
+        )
+        if summary_match:
+            summary = summary_match.group(1).strip()[:500]
+
+        confidence_match = re.search(
+            r'CONFIDENCE:\s*([\d.]+)',
+            response_text, re.IGNORECASE
+        )
+        if confidence_match:
+            try:
+                confidence = float(confidence_match.group(1))
+                if confidence > 1.0:
+                    confidence = confidence / 100.0
+                confidence = max(0.0, min(1.0, confidence))
+            except ValueError:
+                confidence = 0.5
+
+        prompt_match = re.search(
+            r'BETTER_PROMPT:\s*(.*?)(?=\n(?:KEY_PDFS|$))',
+            response_text, re.DOTALL | re.IGNORECASE
+        )
+        if prompt_match:
+            better_prompt = prompt_match.group(1).strip()[:300]
+
+        pdfs_match = re.search(
+            r'KEY_PDFS:\s*(.*?)$',
+            response_text, re.DOTALL | re.IGNORECASE
+        )
+        if pdfs_match:
+            pdfs_text = pdfs_match.group(1).strip()
+            pdf_matches = re.findall(r'([^\s,]+\.pdf)', pdfs_text, re.IGNORECASE)
+            key_pdfs = list(set(pdf_matches))[:5]
+
+    except Exception as e:
+        print(f"Error parsing structured response: {e}")
+        summary = "Error parsing analysis response."
+        confidence = 0.3
+        better_prompt = "Try rephrasing your question with more specific technical terms."
+        key_pdfs = []
+
+    return AnalysisResult(
+        summary=summary,
+        confidence_probability=confidence,
+        suggested_better_prompt=better_prompt,
+        key_source_pdfs=key_pdfs
+    )
+
+def analyze_with_openchat_structured(
+    question: str,
+    context: str,
+    search_results: List[Dict]
+) -> AnalysisResult:
+    """Generate structured analysis using OpenChat model"""
     openchat = models.get("openchat")
     if not openchat:
-        return "OpenChat model not available"
+        return AnalysisResult(
+            summary="OpenChat model not available.",
+            confidence_probability=0.0,
+            suggested_better_prompt="Please ensure OpenChat model is loaded.",
+            key_source_pdfs=[]
+        )
 
     model = openchat["model"]
     tokenizer = openchat["tokenizer"]
 
-    # Prompt structure
+    source_pdfs = list(set(result["source_pdf"] for result in search_results))
+
     prompt = (
-        "Analyze the following technical context.\n\n"
-        "Output the following sections:\n"
-        "1. Best Matching Documents\n"
-        "2. Technical Analysis\n"
-        "3. Key Findings\n\n"
-        "Context:\n"
-        f"{context}\n\n"
-        f"User Question: {question}\n\n"
-        "Analysis:"
+        f"You are analyzing technical document search results. Provide a structured response with exactly these 4 sections:\n\n"
+        f"Question: {question}\n\n"
+        f"Available PDFs: {', '.join(source_pdfs)}\n\n"
+        f"Context:\n{context}\n\n"
+        f"Provide your analysis in exactly this format:\n\n"
+        f"SUMMARY: [Provide a concise 100-word or less summary of the answer based on the context]\n\n"
+        f"CONFIDENCE: [Provide a probability from 0.0 to 1.0 of how confident you are in this answer]\n\n"
+        f"BETTER_PROMPT: [Suggest a more specific prompt that would get better vector search results]\n\n"
+        f"KEY_PDFS: [List the 2-3 most relevant PDF filenames that were used to answer this question]\n\n"
+        f"Response:"
     )
 
     try:
-        # Tokenize and move inputs to same device as model
         inputs = tokenizer.encode(
             prompt,
             return_tensors="pt",
-            max_length=4000,
+            max_length=3500,
             truncation=True
         ).to(model.device)
 
         with torch.no_grad():
             outputs = model.generate(
                 inputs,
-                max_new_tokens=500,
+                max_new_tokens=400,
                 temperature=0.1,
                 do_sample=False,
                 num_beams=1,
@@ -282,15 +351,20 @@ def analyze_with_openchat(question: str, context: str) -> str:
                 eos_token_id=tokenizer.eos_token_id
             )
 
-        # Decode and extract generated content
-        decoded_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        prompt_trimmed = tokenizer.decode(inputs[0], skip_special_tokens=True)
-        analysis = decoded_output[len(prompt_trimmed):].strip()
+        decoded_output = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+        prompt_trimmed = tokenizer.decode(inputs[0], skip_special_tokens=True).strip()
+        analysis_text = decoded_output[len(prompt_trimmed):].strip()
 
-        return analysis
+        return parse_structured_response(analysis_text)
 
     except Exception as e:
-        return f"Error generating analysis: {str(e)}"
+        print(f"Error generating structured analysis: {str(e)}")
+        return AnalysisResult(
+            summary=f"Error generating analysis: {str(e)}",
+            confidence_probability=0.2,
+            suggested_better_prompt="Try a simpler, more direct question about specific technical aspects.",
+            key_source_pdfs=source_pdfs[:3] if source_pdfs else []
+        )
 
 # %% Cell 7: API Endpoints
 
@@ -307,8 +381,8 @@ async def lifespan(app: FastAPI):
 # Create FastAPI app
 app = FastAPI(
     title="MauroGPT2 Model Server",
-    description="BGE Vector Search + OpenChat Analysis for Technical Documents",
-    version="2.0.0",
+    description="BGE Vector Search + Structured OpenChat Analysis for Technical Documents",
+    version="2.1.0",
     lifespan=lifespan
 )
 
@@ -330,10 +404,10 @@ async def health_check():
         timestamp=datetime.now().isoformat()
     )
 
-# Search endpoint
+# Main search endpoint with structured analysis
 @app.post("/api/search", response_model=SearchResponse)
 async def search_endpoint(request: SearchRequest):
-    """Main search endpoint"""
+    """Main search endpoint with structured analysis"""
     try:
         search_data = search_documents(
             question=request.question,
@@ -347,7 +421,11 @@ async def search_endpoint(request: SearchRequest):
 
         analysis = None
         if request.include_analysis and search_data["context"]:
-            analysis = analyze_with_openchat(request.question, search_data["context"])
+            analysis = analyze_with_openchat_structured(
+                request.question,
+                search_data["context"],
+                search_data["results"]
+            )
 
         return SearchResponse(
             question=request.question,
@@ -361,77 +439,12 @@ async def search_endpoint(request: SearchRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# Simple web interface endpoint
-@app.get("/", response_class=HTMLResponse)
-async def web_interface():
-    """Simple web interface"""
-    html_content = """
-<!DOCTYPE html>
-<html>
-<head>
-<title>MauroGPT2 - Technical Document Search</title>
-<style>
-body { font-family: Arial, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; }
-.search-box { width: 100%; padding: 10px; font-size: 16px; margin-bottom: 20px; }
-.search-btn { padding: 10px 20px; font-size: 16px; background: #007cba; color: white; border: none; cursor: pointer; }
-.result { border: 1px solid #ddd; margin: 10px 0; padding: 15px; border-radius: 5px; }
-.result-header { font-weight: bold; color: #007cba; margin-bottom: 10px; }
-.analysis { background: #f0f8ff; padding: 15px; border-radius: 5px; margin: 20px 0; }
-.loading { color: #666; font-style: italic; }
-</style>
-</head>
-<body>
-<h1>MauroGPT2 - Technical Document Search</h1>
-<div>
-<input type="text" id="question" class="search-box" placeholder="Enter your technical question..." />
-<button onclick="search()" class="search-btn">Search</button>
-</div>
-<div id="results"></div>
-<script>
-    async function search() {
-        const question = document.getElementById('question').value;
-        if (!question.trim()) return;
-        document.getElementById('results').innerHTML = '<div class="loading">Searching...</div>';
-        try {
-            const response = await fetch('/api/search', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ question: question, include_analysis: true })
-            });
-            const data = await response.json();
-            displayResults(data);
-        } catch (error) {
-            document.getElementById('results').innerHTML = '<div>Error: ' + error.message + '</div>';
-        }
-    }
-    function displayResults(data) {
-        let html = '<h3>Search Results (' + data.total_results + ' found)</h3>';
-        if (data.analysis) {
-            html += '<div class="analysis"><h4>AI Analysis:</h4>' + data.analysis.replace(/\\n/g, '<br>') + '</div>';
-        }
-        data.results.forEach(result => {
-            html += '<div class="result">';
-            html += '<div class="result-header">' + result.source_pdf + ' (Page ' + result.page_number + ') - Similarity: ' + result.similarity_score.toFixed(3) + '</div>';
-            html += '<div>' + result.document + '</div>';
-            html += '</div>';
-        });
-        document.getElementById('results').innerHTML = html;
-    }
-    document.getElementById('question').addEventListener('keypress', function(e) {
-        if (e.key === 'Enter') search();
-    });
-</script>
-</body>
-</html>
-"""
-    return HTMLResponse(content=html_content)
-
 # %% Cell 8: Main Server Function
 
 def main():
     """Main server function"""
     print("=" * 60)
-    print("MAUROGPT2 MODEL SERVER")
+    print("MAUROGPT2 MODEL SERVER - ENHANCED")
     print("=" * 60)
     print(f"Base Directory: {BASE_DIR}")
     print(f"BGE Model: {BGE_MODEL_PATH}")
